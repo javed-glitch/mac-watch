@@ -1,0 +1,78 @@
+name: Mac watch
+
+on:
+  schedule:
+    # GitHub may run these a few minutes late; alerts land within ~10-15 min of an outage
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Override URL (testing the alert path)
+        required: false
+
+concurrency:
+  group: mac-watch
+  cancel-in-progress: false
+
+env:
+  URL: ${{ inputs.url || secrets.MAC_WATCH_URL }}
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Restore last known state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: macwatch-none
+          restore-keys: macwatch-state-
+
+      - name: Check the tunnel (3 tries, 60s apart)
+        id: check
+        run: |
+          ok=0
+          for i in 1 2 3; do
+            body=$(curl -s -m 15 "$URL" || true)
+            if echo "$body" | grep -q "Online"; then ok=1; break; fi
+            [ "$i" -lt 3 ] && sleep 60
+          done
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
+      - name: Decide and tell me
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          mkdir -p state
+          prev=$(cat state/status 2>/dev/null || echo up)
+          since=$(cat state/since 2>/dev/null || echo "")
+          now=$(date -u +%s)
+          send() { curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" -d chat_id="${TG_CHAT}" --data-urlencode text="$1" > /dev/null; }
+          if [ "${{ steps.check.outputs.ok }}" = "1" ]; then
+            if [ "$prev" = "down" ]; then
+              mins=$(( (now - ${since:-$now}) / 60 ))
+              send "✅ Quant Mac is back online (down about ${mins} min)."
+            fi
+            echo up > state/status; echo "" > state/since; echo 0 > state/reminded
+          else
+            if [ "$prev" != "down" ]; then
+              send "🔴 Quant Mac is not answering (tunnel failed 3 checks). Check power / network, or cycle the smart plug."
+              echo down > state/status; echo "$now" > state/since; echo "$now" > state/reminded
+            else
+              last=$(cat state/reminded 2>/dev/null || echo "$now")
+              if [ $(( now - last )) -ge 3600 ]; then
+                mins=$(( (now - ${since:-$now}) / 60 ))
+                send "🔴 Quant Mac still down (${mins} min)."
+                echo "$now" > state/reminded
+              fi
+            fi
+          fi
+
+      - name: Save state
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: macwatch-state-${{ github.run_id }}
